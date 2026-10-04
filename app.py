@@ -751,7 +751,7 @@ def analyze_market(
     ):
 
         return {
-            "signal": "NO TRADE",
+        
             "confidence": 0,
             "bullish": bullish,
             "bearish": bearish,
@@ -781,13 +781,10 @@ def analyze_market(
 
     else:
 
-        confidence = 0
+        confidence = 50
 
-    if (
-        bullish >= 7
-        and bullish
-        >= bearish + 3
-    ):
+    # Always give UP or DOWN
+    if bullish >= bearish:
 
         signal = "UP"
 
@@ -795,11 +792,12 @@ def analyze_market(
             reasons_up
         )
 
-    elif (
-        bearish >= 7
-        and bearish
-        >= bullish + 3
-    ):
+        if not reason:
+            reason = (
+                "Bullish side has higher score."
+            )
+
+    else:
 
         signal = "DOWN"
 
@@ -807,14 +805,10 @@ def analyze_market(
             reasons_down
         )
 
-    else:
-
-        signal = "NO TRADE"
-
-        reason = (
-            "Strategies are not "
-            "sufficiently aligned."
-        )
+        if not reason:
+            reason = (
+                "Bearish side has higher score."
+            )
 
     return {
         "signal": signal,
@@ -822,7 +816,7 @@ def analyze_market(
         "bullish": bullish,
         "bearish": bearish,
         "reason": reason
-    }
+        }
 
 
 # =========================================================
