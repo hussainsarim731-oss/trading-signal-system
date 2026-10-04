@@ -4,9 +4,7 @@ import json
 import threading
 import time
 from collections import deque
-from datetime import datetime
 
-import requests
 import pandas as pd
 import numpy as np
 
@@ -16,34 +14,81 @@ import numpy as np
 # =========================================================
 
 st.set_page_config(
-    page_title="Smart 5-Second Trading Signal",
+    page_title="Smart Trading Signal",
     page_icon="📊",
     layout="centered"
 )
 
 API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
 
-SYMBOL = "EUR/USD"
-CANDLE_SECONDS = 5
+PAIRS = [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD",
+    "EUR/GBP",
+    "EUR/JPY",
+    "GBP/JPY",
+    "GBP/CHF",
+    "AUD/JPY",
+    "EUR/CHF",
+    "CAD/JPY"
+]
 
-MAX_TICKS = 5000
-MAX_CANDLES = 1200
+TIMEFRAMES = {
+    "5 Seconds": 5,
+    "10 Seconds": 10,
+    "15 Seconds": 15,
+    "30 Seconds": 30,
+    "1 Minute": 60
+}
+
+MAX_TICKS = 10000
+MAX_CANDLES = 1500
+
+
+# =========================================================
+# GLOBAL STORE
+# =========================================================
 
 store = {
-    "ticks": deque(maxlen=MAX_TICKS),
-    "candles": deque(maxlen=MAX_CANDLES),
-    "price": None,
-    "ws_started": False,
+    "ticks": {},
+    "candles": {},
+    "price": {},
+    "connections": {},
     "lock": threading.Lock()
 }
 
 
+def initialize_pair(symbol):
+    with store["lock"]:
+
+        if symbol not in store["ticks"]:
+            store["ticks"][symbol] = deque(
+                maxlen=MAX_TICKS
+            )
+
+        if symbol not in store["candles"]:
+            store["candles"][symbol] = deque(
+                maxlen=MAX_CANDLES
+            )
+
+        if symbol not in store["price"]:
+            store["price"][symbol] = None
+
+
 # =========================================================
-# TECHNICAL INDICATORS
+# INDICATORS
 # =========================================================
 
 def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+    return series.ewm(
+        span=period,
+        adjust=False
+    ).mean()
 
 
 def sma(series, period):
@@ -51,6 +96,7 @@ def sma(series, period):
 
 
 def rsi(series, period=9):
+
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -66,23 +112,27 @@ def rsi(series, period=9):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
-    result = 100 - (100 / (1 + rs))
-
-    return result
+    return 100 - (
+        100 / (1 + rs)
+    )
 
 
 def atr(df, period=14):
+
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
-    prev_close = close.shift(1)
+    previous_close = close.shift(1)
 
     tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
 
     true_range = pd.concat(
         [tr1, tr2, tr3],
@@ -96,6 +146,7 @@ def atr(df, period=14):
 
 
 def adx(df, period=14):
+
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -105,7 +156,8 @@ def adx(df, period=14):
 
     plus_dm = pd.Series(
         np.where(
-            (up_move > down_move) & (up_move > 0),
+            (up_move > down_move)
+            & (up_move > 0),
             up_move,
             0
         ),
@@ -114,7 +166,8 @@ def adx(df, period=14):
 
     minus_dm = pd.Series(
         np.where(
-            (down_move > up_move) & (down_move > 0),
+            (down_move > up_move)
+            & (down_move > 0),
             down_move,
             0
         ),
@@ -136,22 +189,29 @@ def adx(df, period=14):
     ).mean()
 
     plus_di = (
-        100 *
-        plus_dm.ewm(alpha=1 / period, adjust=False).mean()
+        100
+        * plus_dm.ewm(
+            alpha=1 / period,
+            adjust=False
+        ).mean()
         / atr_value.replace(0, np.nan)
     )
 
     minus_di = (
-        100 *
-        minus_dm.ewm(alpha=1 / period, adjust=False).mean()
+        100
+        * minus_dm.ewm(
+            alpha=1 / period,
+            adjust=False
+        ).mean()
         / atr_value.replace(0, np.nan)
     )
 
     dx = (
-        100 *
-        (plus_di - minus_di).abs()
-        /
-        (plus_di + minus_di).replace(0, np.nan)
+        100
+        * (plus_di - minus_di).abs()
+        / (
+            plus_di + minus_di
+        ).replace(0, np.nan)
     )
 
     return dx.ewm(
@@ -161,11 +221,13 @@ def adx(df, period=14):
 
 
 def macd(series):
+
     fast = ema(series, 8)
     slow = ema(series, 21)
 
     line = fast - slow
     signal = ema(line, 5)
+
     histogram = line - signal
 
     return line, signal, histogram
@@ -175,17 +237,27 @@ def macd(series):
 # CANDLE BUILDER
 # =========================================================
 
-def build_candles():
+def build_candles(symbol, seconds):
+
+    initialize_pair(symbol)
+
     with store["lock"]:
-        ticks = list(store["ticks"])
+        ticks = list(
+            store["ticks"][symbol]
+        )
 
     if len(ticks) < 2:
         return
 
     rows = []
 
-    for ts, price in ticks:
-        bucket = int(ts // CANDLE_SECONDS) * CANDLE_SECONDS
+    for timestamp, price in ticks:
+
+        bucket = (
+            int(timestamp / seconds)
+            * seconds
+        )
+
         rows.append(
             {
                 "bucket": bucket,
@@ -198,11 +270,13 @@ def build_candles():
 
     df = pd.DataFrame(rows)
 
-    grouped = df.groupby("bucket")
-
     candles = []
 
-    for bucket, group in grouped:
+    for bucket, group in df.groupby(
+        "bucket",
+        sort=True
+    ):
+
         prices = group["price"].values
 
         candles.append(
@@ -215,14 +289,12 @@ def build_candles():
             }
         )
 
-    candles = sorted(
-        candles,
-        key=lambda x: x["time"]
-    )
+    candles = candles[-MAX_CANDLES:]
 
     with store["lock"]:
-        store["candles"] = deque(
-            candles[-MAX_CANDLES:],
+
+        store["candles"][symbol] = deque(
+            candles,
             maxlen=MAX_CANDLES
         )
 
@@ -231,13 +303,20 @@ def build_candles():
 # WEBSOCKET
 # =========================================================
 
-def websocket_worker():
+def websocket_worker(symbol, seconds):
+
+    initialize_pair(symbol)
+
     if not API_KEY:
         return
 
-    url = "wss://ws.twelvedata.com/v1/quotes/price"
+    url = (
+        "wss://ws.twelvedata.com/"
+        "v1/quotes/price"
+    )
 
     try:
+
         ws = websocket.create_connection(
             url,
             timeout=10
@@ -248,23 +327,28 @@ def websocket_worker():
                 {
                     "action": "subscribe",
                     "params": {
-                        "symbols": SYMBOL
+                        "symbols": symbol
                     }
                 }
             )
         )
 
         while True:
+
             message = ws.recv()
 
             if not message:
                 continue
 
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except:
+                continue
 
             price = None
 
             if isinstance(data, dict):
+
                 if "price" in data:
                     price = data["price"]
 
@@ -282,26 +366,41 @@ def websocket_worker():
             now = time.time()
 
             with store["lock"]:
-                store["price"] = price
-                store["ticks"].append(
+
+                store["price"][symbol] = price
+
+                store["ticks"][symbol].append(
                     (now, price)
                 )
 
-            build_candles()
+            build_candles(
+                symbol,
+                seconds
+            )
 
     except Exception:
         pass
 
 
-def start_websocket():
+def start_connection(symbol, seconds):
+
+    initialize_pair(symbol)
+
+    key = f"{symbol}_{seconds}"
+
     with store["lock"]:
-        if store["ws_started"]:
+
+        if store["connections"].get(
+            key,
+            False
+        ):
             return
 
-        store["ws_started"] = True
+        store["connections"][key] = True
 
     thread = threading.Thread(
         target=websocket_worker,
+        args=(symbol, seconds),
         daemon=True
     )
 
@@ -312,40 +411,86 @@ def start_websocket():
 # ANALYSIS ENGINE
 # =========================================================
 
-def analyze_market():
+def analyze_market(
+    symbol,
+    seconds
+):
+
+    initialize_pair(symbol)
+
+    build_candles(
+        symbol,
+        seconds
+    )
 
     with store["lock"]:
-        candles = list(store["candles"])
+
+        candles = list(
+            store["candles"][symbol]
+        )
 
     if len(candles) < 80:
+
         return {
             "signal": "NO TRADE",
             "confidence": 0,
             "bullish": 0,
             "bearish": 0,
-            "reason": "5-second candle history is still collecting."
+            "reason":
+                "5-second/selected timeframe history "
+                "is still collecting."
         }
 
     df = pd.DataFrame(candles)
 
     close = df["close"]
 
-    df["ema9"] = ema(close, 9)
-    df["ema21"] = ema(close, 21)
-    df["ema50"] = ema(close, 50)
+    # -----------------------------------------------------
+    # INDICATORS
+    # -----------------------------------------------------
 
-    df["rsi"] = rsi(close, 9)
+    df["ema9"] = ema(
+        close,
+        9
+    )
 
-    macd_line, macd_signal, macd_hist = macd(close)
+    df["ema21"] = ema(
+        close,
+        21
+    )
+
+    df["ema50"] = ema(
+        close,
+        50
+    )
+
+    df["sma20"] = sma(
+        close,
+        20
+    )
+
+    df["rsi"] = rsi(
+        close,
+        9
+    )
+
+    macd_line, macd_signal, macd_hist = macd(
+        close
+    )
 
     df["macd"] = macd_line
     df["macd_signal"] = macd_signal
     df["macd_hist"] = macd_hist
 
-    df["atr"] = atr(df, 14)
-    df["adx"] = adx(df, 14)
+    df["atr"] = atr(
+        df,
+        14
+    )
 
-    df["sma20"] = sma(close, 20)
+    df["adx"] = adx(
+        df,
+        14
+    )
 
     latest = df.iloc[-1]
     previous = df.iloc[-2]
@@ -356,202 +501,319 @@ def analyze_market():
     reasons_up = []
     reasons_down = []
 
-    # -----------------------------------------------------
-    # 1. TREND
-    # -----------------------------------------------------
+    # =====================================================
+    # 1 TREND
+    # =====================================================
 
     if (
-        latest["ema9"] > latest["ema21"]
-        and latest["ema21"] > latest["ema50"]
+        latest["ema9"]
+        > latest["ema21"]
+        and latest["ema21"]
+        > latest["ema50"]
     ):
+
         bullish += 2
-        reasons_up.append("EMA trend")
+        reasons_up.append(
+            "EMA trend"
+        )
 
     elif (
-        latest["ema9"] < latest["ema21"]
-        and latest["ema21"] < latest["ema50"]
+        latest["ema9"]
+        < latest["ema21"]
+        and latest["ema21"]
+        < latest["ema50"]
     ):
+
         bearish += 2
-        reasons_down.append("EMA trend")
+        reasons_down.append(
+            "EMA trend"
+        )
 
-    # -----------------------------------------------------
-    # 2. MOMENTUM
-    # -----------------------------------------------------
+    # =====================================================
+    # 2 MOMENTUM
+    # =====================================================
 
-    if latest["close"] > previous["close"]:
+    if (
+        latest["close"]
+        > previous["close"]
+    ):
+
         bullish += 1
-        reasons_up.append("Momentum")
+        reasons_up.append(
+            "Momentum"
+        )
 
-    elif latest["close"] < previous["close"]:
+    elif (
+        latest["close"]
+        < previous["close"]
+    ):
+
         bearish += 1
-        reasons_down.append("Momentum")
+        reasons_down.append(
+            "Momentum"
+        )
 
-    # -----------------------------------------------------
-    # 3. RSI
-    # -----------------------------------------------------
+    # =====================================================
+    # 3 RSI
+    # =====================================================
 
     rsi_value = latest["rsi"]
 
     if 52 <= rsi_value <= 68:
+
         bullish += 1
-        reasons_up.append("RSI")
+        reasons_up.append(
+            "RSI"
+        )
 
     elif 32 <= rsi_value <= 48:
-        bearish += 1
-        reasons_down.append("RSI")
 
-    # -----------------------------------------------------
-    # 4. MACD
-    # -----------------------------------------------------
+        bearish += 1
+        reasons_down.append(
+            "RSI"
+        )
+
+    # =====================================================
+    # 4 MACD
+    # =====================================================
 
     if (
         latest["macd_hist"] > 0
-        and latest["macd_hist"] > previous["macd_hist"]
+        and latest["macd_hist"]
+        > previous["macd_hist"]
     ):
+
         bullish += 2
-        reasons_up.append("MACD")
+        reasons_up.append(
+            "MACD"
+        )
 
     elif (
         latest["macd_hist"] < 0
-        and latest["macd_hist"] < previous["macd_hist"]
+        and latest["macd_hist"]
+        < previous["macd_hist"]
     ):
-        bearish += 2
-        reasons_down.append("MACD")
 
-    # -----------------------------------------------------
-    # 5. ADX TREND STRENGTH
-    # -----------------------------------------------------
+        bearish += 2
+        reasons_down.append(
+            "MACD"
+        )
+
+    # =====================================================
+    # 5 ADX
+    # =====================================================
 
     adx_value = latest["adx"]
 
     if adx_value >= 20:
 
-        if latest["ema9"] > latest["ema21"]:
+        if (
+            latest["ema9"]
+            > latest["ema21"]
+        ):
+
             bullish += 1
-            reasons_up.append("ADX trend")
+            reasons_up.append(
+                "ADX trend"
+            )
 
-        elif latest["ema9"] < latest["ema21"]:
+        elif (
+            latest["ema9"]
+            < latest["ema21"]
+        ):
+
             bearish += 1
-            reasons_down.append("ADX trend")
+            reasons_down.append(
+                "ADX trend"
+            )
 
-    # -----------------------------------------------------
-    # 6. BREAKOUT
-    # -----------------------------------------------------
+    # =====================================================
+    # 6 BREAKOUT
+    # =====================================================
 
     recent = df.iloc[-21:-1]
 
-    resistance = recent["high"].max()
-    support = recent["low"].min()
+    resistance = recent[
+        "high"
+    ].max()
+
+    support = recent[
+        "low"
+    ].min()
 
     if latest["close"] > resistance:
+
         bullish += 2
-        reasons_up.append("Breakout")
+        reasons_up.append(
+            "Breakout"
+        )
 
     elif latest["close"] < support:
-        bearish += 2
-        reasons_down.append("Breakdown")
 
-    # -----------------------------------------------------
-    # 7. CANDLE PRICE ACTION
-    # -----------------------------------------------------
+        bearish += 2
+        reasons_down.append(
+            "Breakdown"
+        )
+
+    # =====================================================
+    # 7 CANDLE PRICE ACTION
+    # =====================================================
 
     body = abs(
-        latest["close"] - latest["open"]
+        latest["close"]
+        - latest["open"]
     )
 
     candle_range = (
-        latest["high"] - latest["low"]
+        latest["high"]
+        - latest["low"]
     )
 
     if candle_range > 0:
 
-        body_ratio = body / candle_range
+        body_ratio = (
+            body / candle_range
+        )
 
         if body_ratio >= 0.60:
 
-            if latest["close"] > latest["open"]:
+            if (
+                latest["close"]
+                > latest["open"]
+            ):
+
                 bullish += 1
-                reasons_up.append("Strong bullish candle")
+                reasons_up.append(
+                    "Bullish candle"
+                )
 
-            elif latest["close"] < latest["open"]:
+            elif (
+                latest["close"]
+                < latest["open"]
+            ):
+
                 bearish += 1
-                reasons_down.append("Strong bearish candle")
+                reasons_down.append(
+                    "Bearish candle"
+                )
 
-    # -----------------------------------------------------
-    # 8. SWING STRUCTURE
-    # -----------------------------------------------------
+    # =====================================================
+    # 8 SWING STRUCTURE
+    # =====================================================
 
     swing_window = df.iloc[-10:-2]
 
-    swing_high = swing_window["high"].max()
-    swing_low = swing_window["low"].min()
+    swing_high = swing_window[
+        "high"
+    ].max()
+
+    swing_low = swing_window[
+        "low"
+    ].min()
 
     if latest["close"] > swing_high:
+
         bullish += 1
-        reasons_up.append("Swing breakout")
+        reasons_up.append(
+            "Swing breakout"
+        )
 
     elif latest["close"] < swing_low:
-        bearish += 1
-        reasons_down.append("Swing breakdown")
 
-    # -----------------------------------------------------
-    # 9. VOLATILITY FILTER
-    # -----------------------------------------------------
+        bearish += 1
+        reasons_down.append(
+            "Swing breakdown"
+        )
+
+    # =====================================================
+    # 9 VOLATILITY FILTER
+    # =====================================================
 
     atr_value = latest["atr"]
 
-    if pd.isna(atr_value) or atr_value <= 0:
-        return {
-            "signal": "NO TRADE",
-            "confidence": 0,
-            "bullish": bullish,
-            "bearish": bearish,
-            "reason": "Volatility data unavailable."
-        }
-
-    # Detect extreme single-candle spike
-    if candle_range > atr_value * 3:
+    if (
+        pd.isna(atr_value)
+        or atr_value <= 0
+    ):
 
         return {
             "signal": "NO TRADE",
             "confidence": 0,
             "bullish": bullish,
             "bearish": bearish,
-            "reason": "Extreme volatility spike."
+            "reason":
+                "Volatility data unavailable."
         }
 
-    # -----------------------------------------------------
-    # FINAL FILTER
-    # -----------------------------------------------------
+    if (
+        candle_range
+        > atr_value * 3
+    ):
 
-    total = bullish + bearish
+        return {
+            "signal": "NO TRADE",
+            "confidence": 0,
+            "bullish": bullish,
+            "bearish": bearish,
+            "reason":
+                "Extreme volatility spike."
+        }
 
-    if total == 0:
-        confidence = 0
-    else:
+    # =====================================================
+    # FINAL DECISION
+    # =====================================================
+
+    total = (
+        bullish
+        + bearish
+    )
+
+    if total > 0:
+
         confidence = int(
-            max(bullish, bearish) /
-            total *
-            100
+            max(
+                bullish,
+                bearish
+            )
+            / total
+            * 100
         )
 
-    # Require strong agreement
-    if bullish >= 7 and bullish >= bearish + 3:
+    else:
+
+        confidence = 0
+
+    if (
+        bullish >= 7
+        and bullish
+        >= bearish + 3
+    ):
 
         signal = "UP"
-        reason = ", ".join(reasons_up)
 
-    elif bearish >= 7 and bearish >= bullish + 3:
+        reason = ", ".join(
+            reasons_up
+        )
+
+    elif (
+        bearish >= 7
+        and bearish
+        >= bullish + 3
+    ):
 
         signal = "DOWN"
-        reason = ", ".join(reasons_down)
+
+        reason = ", ".join(
+            reasons_down
+        )
 
     else:
 
         signal = "NO TRADE"
 
         reason = (
-            "Strategies are not sufficiently aligned."
+            "Strategies are not "
+            "sufficiently aligned."
         )
 
     return {
@@ -567,45 +829,84 @@ def analyze_market():
 # UI
 # =========================================================
 
-st.title("📊 Smart 5-Second Trading Signal")
+st.title(
+    "📊 Smart Trading Signal"
+)
 
 st.caption(
-    "Real market data • Multi-strategy analysis • "
+    "Real market data • "
+    "Multi-strategy analysis • "
     "No forced signals"
 )
 
+
+# =========================================================
+# PAIR
+# =========================================================
+
 pair = st.selectbox(
     "Pair",
-    ["EUR/USD"]
+    PAIRS
 )
 
-timeframe = st.selectbox(
+
+# =========================================================
+# TIMEFRAME
+# =========================================================
+
+timeframe_name = st.selectbox(
     "Timeframe",
-    ["5 Seconds"]
+    list(TIMEFRAMES.keys())
 )
+
+selected_seconds = TIMEFRAMES[
+    timeframe_name
+]
+
+
+# =========================================================
+# START
+# =========================================================
 
 start = st.button(
     "🚀 START ANALYZE",
     use_container_width=True
 )
 
-start_websocket()
+
+# Start selected pair feed
+start_connection(
+    pair,
+    selected_seconds
+)
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
 
 if start:
 
-    progress = st.empty()
+    countdown = st.empty()
 
-    for remaining in range(5, 0, -1):
+    for remaining in range(
+        5,
+        0,
+        -1
+    ):
 
-        progress.markdown(
+        countdown.markdown(
             f"# ⏱️ {remaining}"
         )
 
         time.sleep(1)
 
-    progress.empty()
+    countdown.empty()
 
-    result = analyze_market()
+    result = analyze_market(
+        pair,
+        selected_seconds
+    )
 
     st.divider()
 
@@ -628,14 +929,27 @@ if start:
         )
 
     st.write(
-        f"Strategy agreement: "
-        f"**Bullish {result['bullish']}** | "
-        f"**Bearish {result['bearish']}**"
+        f"**Pair:** {pair}"
     )
 
     st.write(
-        f"Internal agreement score: "
-        f"**{result['confidence']}%**"
+        f"**Timeframe:** "
+        f"{timeframe_name}"
+    )
+
+    st.write(
+        f"**Bullish score:** "
+        f"{result['bullish']}"
+    )
+
+    st.write(
+        f"**Bearish score:** "
+        f"{result['bearish']}"
+    )
+
+    st.write(
+        f"**Agreement score:** "
+        f"{result['confidence']}%"
     )
 
     st.caption(
@@ -643,8 +957,8 @@ if start:
     )
 
     st.caption(
-        "Agreement score is NOT a guaranteed probability "
-        "of winning."
+        "Agreement score is not a "
+        "guaranteed winning probability."
     )
 
 
@@ -652,9 +966,21 @@ if start:
 # LIVE STATUS
 # =========================================================
 
+initialize_pair(pair)
+
 with store["lock"]:
-    live_price = store["price"]
-    candle_count = len(store["candles"])
+
+    live_price = store["price"].get(
+        pair
+    )
+
+    candle_count = len(
+        store["candles"].get(
+            pair,
+            []
+        )
+    )
+
 
 if live_price is not None:
 
@@ -665,6 +991,10 @@ if live_price is not None:
         f"{live_price:.6f}"
     )
 
+
 st.caption(
-    f"5-second candles collected: {candle_count}"
+    f"{pair} • "
+    f"{timeframe_name} • "
+    f"Candles collected: "
+    f"{candle_count}"
 )
